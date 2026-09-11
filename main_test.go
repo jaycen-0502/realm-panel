@@ -3,10 +3,47 @@ package main
 import (
 	"bytes"
 	"html/template"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestSameOriginAllowsMatchingOriginWithSameSiteMetadata(t *testing.T) {
+	r := httptest.NewRequest("POST", "http://43.153.54.154:6800/bind", strings.NewReader("node_name=test"))
+	r.Header.Set("Origin", "http://43.153.54.154:6800")
+	r.Header.Set("Sec-Fetch-Site", "same-site")
+	if !sameOrigin(r) {
+		t.Fatal("matching Origin must not be rejected because Sec-Fetch-Site says same-site")
+	}
+}
+
+func TestSameOriginRejectsUntrustedRequests(t *testing.T) {
+	tests := []struct {
+		name   string
+		origin string
+		site   string
+	}{
+		{name: "different origin", origin: "http://attacker.example"},
+		{name: "cross-site without origin", site: "cross-site"},
+		{name: "same-site without verifiable origin", site: "same-site"},
+		{name: "opaque origin", origin: "null"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest("POST", "http://43.153.54.154:6800/bind", nil)
+			if tc.origin != "" {
+				r.Header.Set("Origin", tc.origin)
+			}
+			if tc.site != "" {
+				r.Header.Set("Sec-Fetch-Site", tc.site)
+			}
+			if sameOrigin(r) {
+				t.Fatal("untrusted request was accepted")
+			}
+		})
+	}
+}
 
 func TestUITemplatesRender(t *testing.T) {
 	funcs := template.FuncMap{

@@ -380,15 +380,21 @@ func (a *App) requireUser(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func sameOrigin(r *http.Request) bool {
-	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
-		return false
-	}
 	origin := r.Header.Get("Origin")
-	if origin == "" {
+	if origin != "" {
+		u, err := url.Parse(origin)
+		return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.User == nil && u.Host != "" && strings.EqualFold(u.Host, r.Host)
+	}
+
+	// Origin is authoritative when present. Some browsers/extensions report a
+	// matching-origin form POST as "same-site", so Sec-Fetch-Site must only be
+	// used as a fallback instead of overriding an exact Origin match.
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "cross-site", "same-site":
+		return false
+	default:
 		return true
 	}
-	u, err := url.Parse(origin)
-	return err == nil && strings.EqualFold(u.Host, r.Host)
 }
 
 func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
