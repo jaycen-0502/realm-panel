@@ -1,0 +1,6 @@
+realm-panel
+realm-panel-*
+agent-linux-amd64
+nodes.json
+rules.json
+*.log
