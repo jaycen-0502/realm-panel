@@ -26,7 +26,13 @@ esac
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl golang-go openssl
+apt-get install -y --no-install-recommends ca-certificates curl openssl tar
+
+machine_arch="$(uname -m)"
+if [[ "$machine_arch" != "x86_64" && "$machine_arch" != "amd64" ]]; then
+  echo "This installer currently supports Linux x86_64 only (detected: $machine_arch)." >&2
+  exit 1
+fi
 
 if [[ -z "$TOKEN" ]]; then TOKEN="$(openssl rand -hex 32)"; fi
 if [[ -z "$PANEL_PASSWORD" ]]; then PANEL_PASSWORD="$(openssl rand -base64 18 | tr -d '\n=/+')"; fi
@@ -43,8 +49,20 @@ echo "Downloading and building Realm Panel..."
 curl --fail --location "$REPO_RAW_URL/main.go" -o "$source_dir/main.go"
 curl --fail --location "$REPO_RAW_URL/agent.go" -o "$source_dir/agent.go"
 
-CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /usr/local/bin/realm-panel "$source_dir/main.go"
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o "$source_dir/agent-linux-amd64" "$source_dir/agent.go"
+# Use the current official Go toolchain so older Debian/Ubuntu releases are not
+# limited by the old compiler in their package repositories.
+go_version="$(curl --fail --silent --show-error --location 'https://go.dev/VERSION?m=text')"
+go_version="${go_version%%$'\n'*}"
+if [[ ! "$go_version" =~ ^go[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+  echo "Could not determine the current stable Go version." >&2
+  exit 1
+fi
+curl --fail --location "https://go.dev/dl/${go_version}.linux-amd64.tar.gz" -o "$source_dir/go.tar.gz"
+tar -xzf "$source_dir/go.tar.gz" -C "$source_dir"
+go_binary="$source_dir/go/bin/go"
+
+CGO_ENABLED=0 "$go_binary" build -trimpath -ldflags='-s -w' -o /usr/local/bin/realm-panel "$source_dir/main.go"
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$go_binary" build -trimpath -ldflags='-s -w' -o "$source_dir/agent-linux-amd64" "$source_dir/agent.go"
 
 install -d -m 0755 /opt/realm-panel
 install -d -m 0700 /var/lib/realm-panel
