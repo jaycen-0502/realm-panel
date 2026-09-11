@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"html/template"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -15,6 +16,30 @@ func TestSameOriginAllowsMatchingOriginWithSameSiteMetadata(t *testing.T) {
 	r.Header.Set("Sec-Fetch-Site", "same-site")
 	if !sameOrigin(r) {
 		t.Fatal("matching Origin must not be rejected because Sec-Fetch-Site says same-site")
+	}
+}
+
+func TestCSRFFormTokenAndTemplateInjection(t *testing.T) {
+	app := &App{sessionKey: []byte("test-session-key")}
+	r := httptest.NewRequest("GET", "http://panel.test/bind", nil)
+	r.AddCookie(&http.Cookie{Name: "realm_session", Value: "session-value"})
+	token := app.csrfToken(r)
+	if token == "" {
+		t.Fatal("csrf token was empty")
+	}
+	tmpl := template.Must(template.New("form").Parse(`<form method="post"><input name="value"></form>`))
+	w := httptest.NewRecorder()
+	if err := executeFormTemplate(w, tmpl, nil, token); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(w.Body.String(), `name="_csrf" value="`+token+`"`) {
+		t.Fatalf("rendered form did not contain csrf token: %s", w.Body.String())
+	}
+	post := httptest.NewRequest("POST", "http://panel.test/bind", strings.NewReader("_csrf="+token))
+	post.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	post.AddCookie(&http.Cookie{Name: "realm_session", Value: "session-value"})
+	if !app.validCSRFForm(httptest.NewRecorder(), post) {
+		t.Fatal("valid csrf form was rejected")
 	}
 }
 

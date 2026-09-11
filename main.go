@@ -366,8 +366,13 @@ func (a *App) validSession(r *http.Request) bool {
 func (a *App) requireUser(w http.ResponseWriter, r *http.Request) bool {
 	if a.validSession(r) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && !sameOrigin(r) {
-			jsonError(w, "cross-site request rejected", http.StatusForbidden)
-			return false
+			// A few browsers and extensions omit or rewrite Origin/Referer on
+			// ordinary form posts. The signed per-session form token is a safe
+			// fallback for our own rendered forms without weakening API requests.
+			if r.Method != http.MethodPost || !a.validCSRFForm(w, r) {
+				jsonError(w, "cross-site request rejected", http.StatusForbidden)
+				return false
+			}
 		}
 		return true
 	}
@@ -377,6 +382,26 @@ func (a *App) requireUser(w http.ResponseWriter, r *http.Request) bool {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 	}
 	return false
+}
+
+func (a *App) csrfToken(r *http.Request) string {
+	c, err := r.Cookie("realm_session")
+	if err != nil || c.Value == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, a.sessionKey)
+	_, _ = mac.Write([]byte("realm-panel-csrf\x00" + c.Value))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (a *App) validCSRFForm(w http.ResponseWriter, r *http.Request) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	if err := r.ParseForm(); err != nil {
+		return false
+	}
+	want := a.csrfToken(r)
+	got := r.FormValue("_csrf")
+	return want != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 func sameOrigin(r *http.Request) bool {
@@ -439,6 +464,7 @@ type bindPageData struct {
 	NodeName  string
 	Command   string
 	Error     string
+	CSRF      string
 }
 
 func (a *App) handleBind(w http.ResponseWriter, r *http.Request) {
@@ -448,7 +474,7 @@ func (a *App) handleBind(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store, max-age=0")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	data := bindPageData{MasterURL: requestBaseURL(r)}
+	data := bindPageData{MasterURL: requestBaseURL(r), CSRF: a.csrfToken(r)}
 	if r.Method == http.MethodPost {
 		r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 		if err := r.ParseForm(); err != nil {
@@ -469,7 +495,7 @@ func (a *App) handleBind(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	if err := a.bindTmpl.Execute(w, data); err != nil {
+	if err := executeFormTemplate(w, a.bindTmpl, data, a.csrfToken(r)); err != nil {
 		log.Printf("bind template: %v", err)
 	}
 }
@@ -483,6 +509,35 @@ func requestBaseURL(r *http.Request) string {
 }
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }
+
+func executeFormTemplate(w http.ResponseWriter, tmpl *template.Template, data any, csrf string) error {
+	var body bytes.Buffer
+	if err := tmpl.Execute(&body, data); err != nil {
+		return err
+	}
+	if csrf != "" {
+		field := `<input type="hidden" name="_csrf" value="` + csrf + `">`
+		bodyText := body.String()
+		for offset := 0; ; {
+			start := strings.Index(bodyText[offset:], "<form ")
+			if start < 0 {
+				break
+			}
+			start += offset
+			end := strings.IndexByte(bodyText[start:], '>')
+			if end < 0 {
+				break
+			}
+			end += start + 1
+			bodyText = bodyText[:end] + field + bodyText[end:]
+			offset = end + len(field)
+		}
+		_, _ = io.WriteString(w, bodyText)
+		return nil
+	}
+	_, _ = io.Copy(w, &body)
+	return nil
+}
 
 func handleAppCSS(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -534,7 +589,7 @@ func (a *App) handleHome(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(rules, func(i, j int) bool { return rules[i].CreatedAt.After(rules[j].CreatedAt) })
 	msg := r.URL.Query().Get("msg")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := a.tmpl.Execute(w, map[string]any{"Nodes": nodes, "NodeList": nodeList, "Rules": rules, "Message": msg, "MessageKind": r.URL.Query().Get("kind"), "NodeCount": len(nodes), "OnlineCount": onlineCount, "RuleCount": len(rules)}); err != nil {
+	if err := executeFormTemplate(w, a.tmpl, map[string]any{"Nodes": nodes, "NodeList": nodeList, "Rules": rules, "Message": msg, "MessageKind": r.URL.Query().Get("kind"), "NodeCount": len(nodes), "OnlineCount": onlineCount, "RuleCount": len(rules), "CSRF": a.csrfToken(r)}, a.csrfToken(r)); err != nil {
 		log.Printf("template: %v", err)
 	}
 }
