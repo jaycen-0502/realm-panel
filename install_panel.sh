@@ -2,11 +2,13 @@
 set -Eeuo pipefail
 
 # Debian/Ubuntu one-click installer for the Realm control panel.
-# Optional usage: sudo bash install_panel.sh [TOKEN] [PANEL_PASSWORD]
+# Interactive by default. Backward-compatible optional usage:
+# sudo bash install_panel.sh [TOKEN] [PANEL_PASSWORD] [PANEL_USERNAME]
 
 REPO_RAW_URL="${REPO_RAW_URL:-https://raw.githubusercontent.com/jaycen-0502/realm-panel/main}"
-TOKEN="${1:-}"
-PANEL_PASSWORD="${2:-}"
+TOKEN="${1:-${REALM_TOKEN:-}}"
+PANEL_PASSWORD="${2:-${PANEL_PASSWORD:-}}"
+PANEL_USERNAME="${3:-${PANEL_USERNAME:-}}"
 
 if [[ $EUID -ne 0 ]]; then
   echo "Please run as root (or with sudo)." >&2
@@ -35,13 +37,33 @@ if [[ "$machine_arch" != "x86_64" && "$machine_arch" != "amd64" ]]; then
 fi
 
 if [[ -z "$TOKEN" ]]; then TOKEN="$(openssl rand -hex 32)"; fi
+if [[ -z "$PANEL_USERNAME" && -t 1 ]]; then
+  read -r -p "Administrator username [admin]: " PANEL_USERNAME </dev/tty
+  PANEL_USERNAME="${PANEL_USERNAME:-admin}"
+fi
+if [[ -z "$PANEL_PASSWORD" && -t 1 ]]; then
+  while true; do
+    read -r -s -p "Administrator password (at least 12 characters): " PANEL_PASSWORD </dev/tty
+    printf '\n'
+    read -r -s -p "Confirm password: " panel_password_confirm </dev/tty
+    printf '\n'
+    if (( ${#PANEL_PASSWORD} < 12 )); then
+      echo "Password is too short; please try again." >&2
+    elif [[ "$PANEL_PASSWORD" == "$panel_password_confirm" ]]; then
+      break
+    else
+      echo "Passwords do not match; please try again." >&2
+    fi
+  done
+fi
+if [[ -z "$PANEL_USERNAME" ]]; then PANEL_USERNAME="admin"; fi
 if [[ -z "$PANEL_PASSWORD" ]]; then PANEL_PASSWORD="$(openssl rand -base64 18 | tr -d '\n=/+')"; fi
-if [[ "$TOKEN" == *$'\n'* || "$PANEL_PASSWORD" == *$'\n'* ]]; then
-  echo "Token and password cannot contain newlines." >&2
+if [[ "$TOKEN" == *$'\n'* || "$PANEL_USERNAME" == *$'\n'* || "$PANEL_PASSWORD" == *$'\n'* ]]; then
+  echo "Username, token and password cannot contain newlines." >&2
   exit 2
 fi
-if (( ${#TOKEN} < 32 || ${#PANEL_PASSWORD} < 12 )); then
-  echo "Token must be at least 32 characters and panel password at least 12 characters." >&2
+if (( ${#PANEL_USERNAME} < 3 || ${#PANEL_USERNAME} > 64 || ${#TOKEN} < 32 || ${#PANEL_PASSWORD} < 12 )); then
+  echo "Username must be 3-64 characters, token at least 32, and password at least 12." >&2
   exit 2
 fi
 
@@ -91,6 +113,7 @@ quote_env() {
 
 umask 077
 {
+  printf 'PANEL_USERNAME=%s\n' "$(quote_env "$PANEL_USERNAME")"
   printf 'PANEL_PASSWORD=%s\n' "$(quote_env "$PANEL_PASSWORD")"
   printf 'REALM_TOKEN=%s\n' "$(quote_env "$TOKEN")"
   printf 'PANEL_ADDR=":6800"\n'
@@ -146,6 +169,7 @@ panel_ip="${panel_ip:-MASTER_IP}"
 echo
 echo "Realm Panel is installed and listening on port 6800."
 echo "Panel URL: http://${panel_ip}:6800"
+echo "Panel username: ${PANEL_USERNAME}"
 echo "Panel password: ${PANEL_PASSWORD}"
 echo "Shared token: ${TOKEN}"
 echo

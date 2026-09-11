@@ -2,6 +2,7 @@
 //
 // Required environment variables:
 //
+//	PANEL_USERNAME  username used by the web login page
 //	PANEL_PASSWORD  password used by the web login page
 //	REALM_TOKEN     shared secret used by the panel and every agent
 //
@@ -128,6 +129,7 @@ func (s *Store) saveRulesLocked() error {
 
 type App struct {
 	store         *Store
+	username      string
 	password      string
 	token         string
 	sessionKey    []byte
@@ -159,24 +161,25 @@ type RateLimiter struct {
 }
 
 func main() {
+	username := strings.TrimSpace(os.Getenv("PANEL_USERNAME"))
 	password := os.Getenv("PANEL_PASSWORD")
 	token := os.Getenv("REALM_TOKEN")
-	if len(password) < 12 || len(token) < 32 {
-		log.Fatal("PANEL_PASSWORD must be at least 12 characters and REALM_TOKEN at least 32 characters")
+	if len(username) < 3 || len(username) > 64 || len(password) < 12 || len(token) < 32 {
+		log.Fatal("PANEL_USERNAME must be 3-64 characters, PANEL_PASSWORD at least 12 characters, and REALM_TOKEN at least 32 characters")
 	}
 	dataDir := getenv("DATA_DIR", ".")
 	store, err := newStore(dataDir)
 	if err != nil {
 		log.Fatal(err)
 	}
-	h := sha256.Sum256([]byte("realm-panel-session\x00" + password + "\x00" + token))
+	h := sha256.Sum256([]byte("realm-panel-session\x00" + username + "\x00" + password + "\x00" + token))
 	agentBinary := getenv("AGENT_BINARY", "./agent-linux-amd64")
 	binaryMAC, err := fileHMAC(agentBinary, token)
 	if err != nil {
 		log.Fatalf("cannot authenticate agent binary: %v", err)
 	}
 	app := &App{
-		store: store, password: password, token: token, sessionKey: h[:],
+		store: store, username: username, password: password, token: token, sessionKey: h[:],
 		agentBinary:   agentBinary,
 		binaryMAC:     binaryMAC,
 		client:        &http.Client{Timeout: 12 * time.Second},
@@ -399,8 +402,10 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad form", 400)
 		return
 	}
-	if subtle.ConstantTimeCompare([]byte(r.FormValue("password")), []byte(a.password)) != 1 {
-		http.Error(w, "密码错误", http.StatusUnauthorized)
+	userOK := subtle.ConstantTimeCompare([]byte(r.FormValue("username")), []byte(a.username))
+	passwordOK := subtle.ConstantTimeCompare([]byte(r.FormValue("password")), []byte(a.password))
+	if userOK&passwordOK != 1 {
+		http.Error(w, "用户名或密码错误", http.StatusUnauthorized)
 		return
 	}
 	a.issueSession(w, r)
@@ -751,6 +756,6 @@ func (a *App) actionOK(w http.ResponseWriter, r *http.Request, msg string) {
 	}
 }
 
-const loginHTML = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Realm 登录</title><style>body{font:16px system-ui;background:#101827;color:#e5e7eb;display:grid;place-items:center;height:100vh;margin:0}form{background:#1f2937;padding:28px;border-radius:14px;width:min(340px,80vw)}input,button{box-sizing:border-box;width:100%;padding:12px;margin-top:12px;border-radius:8px;border:1px solid #4b5563}button{background:#2563eb;color:white;border:0}</style><form method="post"><h2>Realm 管理面板</h2><input name="password" type="password" placeholder="管理密码" required autofocus><button>登录</button></form></html>`
+const loginHTML = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Realm 登录</title><style>body{font:16px system-ui;background:#101827;color:#e5e7eb;display:grid;place-items:center;height:100vh;margin:0}form{background:#1f2937;padding:28px;border-radius:14px;width:min(340px,80vw)}input,button{box-sizing:border-box;width:100%;padding:12px;margin-top:12px;border-radius:8px;border:1px solid #4b5563}button{background:#2563eb;color:white;border:0}</style><form method="post"><h2>Realm 管理面板</h2><input name="username" type="text" placeholder="管理员用户名" autocomplete="username" required autofocus><input name="password" type="password" placeholder="管理密码" autocomplete="current-password" required><button>登录</button></form></html>`
 
 const pageHTML = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Realm 面板</title><style>body{font:15px system-ui;background:#f3f4f6;color:#111827;margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;align-items:center}.card{background:white;padding:20px;margin:18px 0;border-radius:12px;box-shadow:0 2px 10px #0001}input,select,button{padding:9px;border:1px solid #d1d5db;border-radius:7px}button{background:#2563eb;color:white;border:0}.danger{background:#dc2626}table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid #e5e7eb;padding:10px}.msg{background:#dbeafe;padding:10px;border-radius:8px}.muted{color:#6b7280;font-size:13px}@media(max-width:700px){table{display:block;overflow:auto}}</style><div class="wrap"><div class="top"><h1>Realm 转发管理</h1><a href="/logout">退出</a></div>{{if .Message}}<div class="msg">{{.Message}}</div>{{end}}<div class="card"><h2>添加规则</h2><form method="post" action="/api/add_rule"><select name="node_id" required><option value="">选择节点</option>{{range $id,$n := .Nodes}}<option value="{{$id}}">{{$n.Name}}（{{$n.IP}}）</option>{{end}}</select> <input name="listen" placeholder="0.0.0.0:5000" required> <input name="remote" placeholder="目标IP或域名:端口" required> <button>保存并应用</button></form></div><div class="card"><h2>节点</h2><table><tr><th>名称</th><th>IP</th><th>Agent</th><th>最后注册/心跳</th></tr>{{range $id,$n := .Nodes}}<tr><td>{{$n.Name}}</td><td>{{$n.IP}}</td><td>{{$n.AgentURL}}</td><td>{{age $n.LastSeen}} 前</td></tr>{{else}}<tr><td colspan="4" class="muted">暂无节点，请在节点机器执行安装命令。</td></tr>{{end}}</table></div><div class="card"><h2>转发规则</h2><table><tr><th>节点</th><th>监听</th><th>目标</th><th></th></tr>{{range .Rules}}<tr><td>{{nodeName $.Nodes .NodeID}}</td><td>{{.Listen}}</td><td>{{.Remote}}</td><td><form method="post" action="/api/delete_rule"><input type="hidden" name="id" value="{{.ID}}"><button class="danger">删除</button></form></td></tr>{{else}}<tr><td colspan="4" class="muted">暂无规则。</td></tr>{{end}}</table></div></div></html>`

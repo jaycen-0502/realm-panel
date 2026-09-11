@@ -22,13 +22,13 @@
 curl -fsSL https://raw.githubusercontent.com/jaycen-0502/realm-panel/main/install_panel.sh | sudo bash
 ```
 
-脚本会生成面板密码和共享 Token，安装完成后显示登录地址及节点绑定命令。
+脚本会在终端中提示输入管理员用户名和密码，并自动生成无需记忆的共享 Token。安装完成后显示登录地址及节点绑定命令。
 
-也可以自行指定 Token 和面板密码：
+也可以使用参数指定 Token、面板密码和用户名：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jaycen-0502/realm-panel/main/install_panel.sh \
-  | sudo bash -s -- '你的长随机Token' '你的面板密码'
+  | sudo bash -s -- '你的长随机Token' '你的面板密码' '你的管理员用户名'
 ```
 
 ## 节点一键绑定
