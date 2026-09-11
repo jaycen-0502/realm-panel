@@ -127,20 +127,42 @@ func (s *Store) saveRulesLocked() error {
 }
 
 type App struct {
-	store       *Store
-	password    string
-	token       string
-	sessionKey  []byte
-	agentBinary string
-	client      *http.Client
-	tmpl        *template.Template
+	store         *Store
+	password      string
+	token         string
+	sessionKey    []byte
+	agentBinary   string
+	binaryMAC     string
+	client        *http.Client
+	tmpl          *template.Template
+	replay        *ReplayGuard
+	loginLimit    *RateLimiter
+	apiLimit      *RateLimiter
+	downloadLimit *RateLimiter
+}
+
+type ReplayGuard struct {
+	mu   sync.Mutex
+	seen map[string]time.Time
+}
+
+type rateEntry struct {
+	window time.Time
+	count  int
+}
+
+type RateLimiter struct {
+	mu      sync.Mutex
+	entries map[string]rateEntry
+	limit   int
+	window  time.Duration
 }
 
 func main() {
 	password := os.Getenv("PANEL_PASSWORD")
 	token := os.Getenv("REALM_TOKEN")
-	if password == "" || token == "" {
-		log.Fatal("PANEL_PASSWORD and REALM_TOKEN must both be set")
+	if len(password) < 12 || len(token) < 32 {
+		log.Fatal("PANEL_PASSWORD must be at least 12 characters and REALM_TOKEN at least 32 characters")
 	}
 	dataDir := getenv("DATA_DIR", ".")
 	store, err := newStore(dataDir)
@@ -148,10 +170,20 @@ func main() {
 		log.Fatal(err)
 	}
 	h := sha256.Sum256([]byte("realm-panel-session\x00" + password + "\x00" + token))
+	agentBinary := getenv("AGENT_BINARY", "./agent-linux-amd64")
+	binaryMAC, err := fileHMAC(agentBinary, token)
+	if err != nil {
+		log.Fatalf("cannot authenticate agent binary: %v", err)
+	}
 	app := &App{
 		store: store, password: password, token: token, sessionKey: h[:],
-		agentBinary: getenv("AGENT_BINARY", "./agent-linux-amd64"),
-		client:      &http.Client{Timeout: 12 * time.Second},
+		agentBinary:   agentBinary,
+		binaryMAC:     binaryMAC,
+		client:        &http.Client{Timeout: 12 * time.Second},
+		replay:        &ReplayGuard{seen: make(map[string]time.Time)},
+		loginLimit:    &RateLimiter{entries: make(map[string]rateEntry), limit: 10, window: 5 * time.Minute},
+		apiLimit:      &RateLimiter{entries: make(map[string]rateEntry), limit: 120, window: time.Minute},
+		downloadLimit: &RateLimiter{entries: make(map[string]rateEntry), limit: 20, window: time.Minute},
 		tmpl: template.Must(template.New("panel").Funcs(template.FuncMap{
 			"age": func(t time.Time) string {
 				if t.IsZero() {
@@ -170,14 +202,14 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", app.handleHome)
-	mux.HandleFunc("/login", app.handleLogin)
+	mux.HandleFunc("/login", app.rateLimited(app.loginLimit, app.handleLogin))
 	mux.HandleFunc("/logout", app.handleLogout)
-	mux.HandleFunc("/api/register", app.handleRegister)
+	mux.HandleFunc("/api/register", app.rateLimited(app.apiLimit, app.handleRegister))
 	mux.HandleFunc("/api/add_rule", app.handleAddRule)
 	mux.HandleFunc("/api/delete_rule", app.handleDeleteRule)
-	mux.HandleFunc("/downloads/agent-linux-amd64", app.handleAgentDownload)
+	mux.HandleFunc("/downloads/agent-linux-amd64", app.rateLimited(app.downloadLimit, app.handleAgentDownload))
 	addr := getenv("PANEL_ADDR", ":6800")
-	server := &http.Server{Addr: addr, Handler: securityHeaders(mux), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	server := &http.Server{Addr: addr, Handler: securityHeaders(mux), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	log.Printf("realm panel listening on %s", addr)
 	log.Fatal(server.ListenAndServe())
 }
@@ -199,12 +231,94 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-func (a *App) validToken(r *http.Request) bool {
-	got := r.Header.Get(tokenHeader)
-	if got == "" {
-		got = r.Header.Get("-Token")
-	} // compatibility with the requested literal "-token" header
-	return subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) == 1
+func (l *RateLimiter) allow(key string) bool {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e := l.entries[key]
+	if e.window.IsZero() || now.Sub(e.window) >= l.window {
+		e = rateEntry{window: now}
+	}
+	e.count++
+	l.entries[key] = e
+	if len(l.entries) > 4096 {
+		for k, v := range l.entries {
+			if now.Sub(v.window) >= l.window {
+				delete(l.entries, k)
+			}
+		}
+	}
+	return e.count <= l.limit
+}
+
+func remoteIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func (a *App) rateLimited(l *RateLimiter, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !l.allow(remoteIP(r)) {
+			w.Header().Set("Retry-After", "60")
+			jsonError(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// verifySignedRequest checks a time-bound HMAC signature and consumes its nonce.
+// The shared token is never sent over the network.
+func (a *App) verifySignedRequest(r *http.Request) bool {
+	body, err := io.ReadAll(io.LimitReader(r.Body, (64<<10)+1))
+	if err != nil || len(body) > 64<<10 {
+		return false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	ts := r.Header.Get("X-Realm-Timestamp")
+	nonce := r.Header.Get("X-Realm-Nonce")
+	sig, err := hex.DecodeString(r.Header.Get(tokenHeader))
+	if err != nil || len(nonce) < 20 || len(nonce) > 64 {
+		return false
+	}
+	unix, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil || absDuration(time.Since(time.Unix(unix, 0))) > 5*time.Minute {
+		return false
+	}
+	bodyHash := sha256.Sum256(body)
+	message := r.Method + "\n" + r.URL.Path + "\n" + ts + "\n" + nonce + "\n" + hex.EncodeToString(bodyHash[:])
+	mac := hmac.New(sha256.New, []byte(a.token))
+	_, _ = mac.Write([]byte(message))
+	if !hmac.Equal(sig, mac.Sum(nil)) {
+		return false
+	}
+	return a.replay.consume(nonce, time.Now().Add(6*time.Minute))
+}
+
+func (g *ReplayGuard) consume(nonce string, expiry time.Time) bool {
+	now := time.Now()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for k, exp := range g.seen {
+		if now.After(exp) {
+			delete(g.seen, k)
+		}
+	}
+	if _, exists := g.seen[nonce]; exists {
+		return false
+	}
+	g.seen[nonce] = expiry
+	return true
+}
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
 }
 
 func (a *App) issueSession(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +358,11 @@ func (a *App) validSession(r *http.Request) bool {
 }
 
 func (a *App) requireUser(w http.ResponseWriter, r *http.Request) bool {
-	if a.validSession(r) || a.validToken(r) {
+	if a.validSession(r) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && !sameOrigin(r) {
+			jsonError(w, "cross-site request rejected", http.StatusForbidden)
+			return false
+		}
 		return true
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/") {
@@ -253,6 +371,18 @@ func (a *App) requireUser(w http.ResponseWriter, r *http.Request) bool {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 	}
 	return false
+}
+
+func sameOrigin(r *http.Request) bool {
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	return err == nil && strings.EqualFold(u.Host, r.Host)
 }
 
 func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -264,6 +394,7 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad form", 400)
 		return
@@ -318,8 +449,8 @@ func (a *App) handleRegister(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	if !a.validToken(r) {
-		jsonError(w, "invalid token", 401)
+	if !a.verifySignedRequest(r) {
+		jsonError(w, "invalid or replayed signature", 401)
 		return
 	}
 	var req registerRequest
@@ -346,8 +477,12 @@ func (a *App) handleRegister(w http.ResponseWriter, r *http.Request) {
 	id := hex.EncodeToString(idHash[:8])
 	n := Node{ID: id, Name: req.Name, IP: req.IP, AgentURL: req.AgentURL, LastSeen: time.Now().UTC()}
 	a.store.mu.Lock()
+	previous, existed := a.store.nodes[id]
 	a.store.nodes[id] = n
-	err = a.store.saveNodesLocked()
+	metadataChanged := !existed || previous.Name != n.Name || previous.IP != n.IP || previous.AgentURL != n.AgentURL
+	if metadataChanged || time.Since(previous.LastSeen) >= 5*time.Minute {
+		err = a.store.saveNodesLocked()
+	}
 	a.store.mu.Unlock()
 	if err != nil {
 		jsonError(w, "cannot save node", 500)
@@ -364,6 +499,7 @@ func (a *App) handleAddRule(w http.ResponseWriter, r *http.Request) {
 	if !a.requireUser(w, r) {
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
 	var nodeID, listen, remote string
 	if strings.Contains(r.Header.Get("Content-Type"), "application/json") {
 		var req struct {
@@ -426,6 +562,7 @@ func (a *App) handleDeleteRule(w http.ResponseWriter, r *http.Request) {
 	if !a.requireUser(w, r) {
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
 	var id string
 	if strings.Contains(r.Header.Get("Content-Type"), "application/json") {
 		var req struct{ ID string }
@@ -475,8 +612,9 @@ func (a *App) callAgent(ctx context.Context, node Node, path string, payload any
 		return err
 	}
 	req.Header.Set("Content-Type", "application/vnd.realm.encrypted+json")
-	req.Header.Set(tokenHeader, a.token)
-	req.Header.Set("-Token", a.token)
+	if err := signRequest(req, b, a.token); err != nil {
+		return err
+	}
 	resp, err := a.client.Do(req)
 	if err != nil {
 		return err
@@ -486,6 +624,23 @@ func (a *App) callAgent(ctx context.Context, node Node, path string, payload any
 	if resp.StatusCode/100 != 2 {
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(result)))
 	}
+	return nil
+}
+
+func signRequest(req *http.Request, body []byte, token string) error {
+	nonceBytes := make([]byte, 18)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return err
+	}
+	nonce := base64.RawURLEncoding.EncodeToString(nonceBytes)
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	bodyHash := sha256.Sum256(body)
+	message := req.Method + "\n" + req.URL.Path + "\n" + ts + "\n" + nonce + "\n" + hex.EncodeToString(bodyHash[:])
+	mac := hmac.New(sha256.New, []byte(token))
+	_, _ = mac.Write([]byte(message))
+	req.Header.Set("X-Realm-Timestamp", ts)
+	req.Header.Set("X-Realm-Nonce", nonce)
+	req.Header.Set(tokenHeader, hex.EncodeToString(mac.Sum(nil)))
 	return nil
 }
 
@@ -517,13 +672,23 @@ func (a *App) handleAgentDownload(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	if !a.validToken(r) {
-		jsonError(w, "invalid token", 401)
-		return
-	}
 	w.Header().Set("Content-Disposition", `attachment; filename="realm-agent"`)
 	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Realm-Binary-HMAC", a.binaryMAC)
 	http.ServeFile(w, r, a.agentBinary)
+}
+
+func fileHMAC(path, token string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	mac := hmac.New(sha256.New, []byte(token))
+	if _, err := io.Copy(mac, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 
 func validateEndpoint(s string, listen bool) error {
@@ -553,7 +718,7 @@ func randomID() (string, error) {
 }
 func decodeJSON(r *http.Request, dst any) error {
 	defer r.Body.Close()
-	d := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	d := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
 	d.DisallowUnknownFields()
 	return d.Decode(dst)
 }

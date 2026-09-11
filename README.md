@@ -7,7 +7,8 @@
 - 网页面板登录、节点列表、规则添加与删除
 - Agent 自动注册并每分钟刷新在线时间
 - AES-256-GCM 加密面板到 Agent 的规则指令
-- Token 请求头鉴权
+- 短时 HMAC-SHA256 请求签名，Token 不通过网络发送
+- 随机 Nonce 防重放、来源 IP 限制和按 IP 请求限速
 - `nodes.json` 与 `rules.json` 原子持久化
 - Agent 原子生成 Realm 多 `[[endpoints]]` 配置
 - Realm 重启失败自动恢复旧配置
@@ -45,8 +46,22 @@ Agent 会从 Realm 官方 GitHub Release 下载 Linux x86_64 版本，并注册 
 
 - 主控机器开放 `6800/TCP`，供浏览器和节点注册访问。
 - 每台 Agent 节点开放 `6800/TCP`，且防火墙应只允许主控 IP 访问。
-- 公网部署必须在面板和 Agent 前配置 HTTPS、VPN 或可信内网。加密载荷不能替代 HTTPS，因为请求头中的 Token 仍属于敏感信息。
+- 当 `MASTER_URL` 使用 IP 地址时，Agent 会自动拒绝来自其他源 IP 的控制请求；使用域名时应通过防火墙只允许主控出口 IP。
+- 公网部署仍建议配置 HTTPS、WireGuard/VPN 或可信内网。HMAC 与加密载荷保护控制指令，但 HTTPS 还能隐藏流量元数据并提供服务端身份认证。
+- 主控与节点时间误差需小于五分钟，以便短时签名验证。建议启用系统自带的 NTP 时间同步。
 - `/etc/realm-panel.env` 与 `/etc/realm/agent.env` 均为 root-only 权限，请妥善备份。
+
+## 故障隔离
+
+Realm、Agent、主控面板是三个独立进程。实际端口转发完全由节点本地的 `realm.service` 承担：
+
+- 主控面板宕机或网络中断，不影响任何已经运行的转发。
+- Agent 宕机，不影响 Realm；仅暂时无法增加或删除规则。
+- Agent 只在规则发生变化时重启 Realm，并在重启失败时恢复旧配置。
+- 节点重启后，Realm 直接读取最后一次成功落盘的配置，不需要先连接主控。
+- Agent 本地状态与配置采用原子替换，启动时会检查并修复意外中断造成的不一致。
+
+主控和 Realm 使用独立的低权限系统账户运行；Systemd 服务启用了文件系统、设备、内核和 Linux capability 限制。Agent 因需要调用 `systemctl restart realm` 仍以 root 运行，但文件系统写权限被限制在 `/etc/realm`。
 
 ## 常用命令
 

@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: stable
+      - name: Format check
+        run: test -z "$(gofmt -l main.go agent.go)"
+      - name: Build and vet
+        run: |
+          go build -o /tmp/realm-panel main.go
+          go build -o /tmp/realm-agent agent.go
+          go vet main.go
+          go vet agent.go
+      - name: Shell syntax and lint
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          bash -n install_panel.sh install_agent.sh
+          shellcheck install_panel.sh install_agent.sh

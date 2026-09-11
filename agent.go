@@ -6,9 +6,11 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,6 +51,24 @@ type Agent struct {
 	realmUnit  string
 	rules      map[string]Rule
 	client     *http.Client
+	replay     *ReplayGuard
+	limit      *RateLimiter
+	masterIP   net.IP
+}
+
+type ReplayGuard struct {
+	mu   sync.Mutex
+	seen map[string]time.Time
+}
+type rateEntry struct {
+	window time.Time
+	count  int
+}
+type RateLimiter struct {
+	mu      sync.Mutex
+	entries map[string]rateEntry
+	limit   int
+	window  time.Duration
 }
 
 func main() {
@@ -57,6 +77,11 @@ func main() {
 		listenAddr: getenv("AGENT_ADDR", ":6800"), configPath: getenv("REALM_CONFIG", "/etc/realm/config.toml"),
 		statePath: getenv("AGENT_STATE", "/etc/realm/agent-rules.json"), realmUnit: getenv("REALM_SERVICE", "realm.service"),
 		rules: map[string]Rule{}, client: &http.Client{Timeout: 12 * time.Second},
+		replay: &ReplayGuard{seen: make(map[string]time.Time)},
+		limit:  &RateLimiter{entries: make(map[string]rateEntry), limit: 120, window: time.Minute},
+	}
+	if len(a.token) < 32 {
+		log.Fatal("REALM_TOKEN must be at least 32 characters")
 	}
 	a.nodeIP = os.Getenv("NODE_IP")
 	if a.nodeIP == "" {
@@ -66,18 +91,30 @@ func main() {
 	if a.publicURL == "" {
 		a.publicURL = "http://" + net.JoinHostPort(a.nodeIP, portOnly(a.listenAddr))
 	}
+	a.masterIP = configuredMasterIP(a.masterURL)
+	if a.masterIP != nil {
+		log.Printf("agent API restricted to master source IP %s", a.masterIP)
+	} else {
+		log.Printf("warning: master host is not an IP; enforce source filtering with a firewall")
+	}
 	if err := a.loadState(); err != nil {
 		log.Fatal(err)
 	}
-	if err := a.writeConfig(); err != nil {
+	changed, err := a.reconcileConfig()
+	if err != nil {
 		log.Fatal(err)
+	}
+	if changed && len(a.rules) > 0 {
+		if err := restart(a.realmUnit); err != nil {
+			log.Printf("startup config reconciliation could not restart Realm: %v", err)
+		}
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", a.auth(a.handleHealth))
 	mux.HandleFunc("/api/rules/add", a.auth(a.handleAdd))
 	mux.HandleFunc("/api/rules/delete", a.auth(a.handleDelete))
-	server := &http.Server{Addr: a.listenAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 20 * time.Second, IdleTimeout: 60 * time.Second}
+	server := &http.Server{Addr: a.listenAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 20 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	go a.registrationLoop()
 	log.Printf("realm agent %q listening on %s; advertising %s", a.nodeName, a.listenAddr, a.publicURL)
 	log.Fatal(server.ListenAndServe())
@@ -99,16 +136,109 @@ func getenv(k, fallback string) string {
 
 func (a *Agent) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		got := r.Header.Get(tokenHeader)
-		if got == "" {
-			got = r.Header.Get("-Token")
+		ip := net.ParseIP(remoteIP(r))
+		if a.masterIP != nil && (ip == nil || !ip.Equal(a.masterIP)) {
+			jsonError(w, "source not allowed", http.StatusForbidden)
+			return
 		}
-		if subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) != 1 {
-			jsonError(w, "invalid token", 401)
+		if !a.limit.allow(remoteIP(r)) {
+			w.Header().Set("Retry-After", "60")
+			jsonError(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
+		if !a.verifySignedRequest(r) {
+			jsonError(w, "invalid or replayed signature", 401)
 			return
 		}
 		next(w, r)
 	}
+}
+
+func configuredMasterIP(masterURL string) net.IP {
+	if explicit := strings.TrimSpace(os.Getenv("MASTER_SOURCE_IP")); explicit != "" {
+		return net.ParseIP(explicit)
+	}
+	u, err := url.Parse(masterURL)
+	if err != nil {
+		return nil
+	}
+	return net.ParseIP(u.Hostname())
+}
+
+func remoteIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func (l *RateLimiter) allow(key string) bool {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e := l.entries[key]
+	if e.window.IsZero() || now.Sub(e.window) >= l.window {
+		e = rateEntry{window: now}
+	}
+	e.count++
+	l.entries[key] = e
+	if len(l.entries) > 1024 {
+		for k, v := range l.entries {
+			if now.Sub(v.window) >= l.window {
+				delete(l.entries, k)
+			}
+		}
+	}
+	return e.count <= l.limit
+}
+
+func (a *Agent) verifySignedRequest(r *http.Request) bool {
+	body, err := io.ReadAll(io.LimitReader(r.Body, (64<<10)+1))
+	if err != nil || len(body) > 64<<10 {
+		return false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	ts, nonce := r.Header.Get("X-Realm-Timestamp"), r.Header.Get("X-Realm-Nonce")
+	sig, err := hex.DecodeString(r.Header.Get(tokenHeader))
+	if err != nil || len(nonce) < 20 || len(nonce) > 64 {
+		return false
+	}
+	unix, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil || absDuration(time.Since(time.Unix(unix, 0))) > 5*time.Minute {
+		return false
+	}
+	bodyHash := sha256.Sum256(body)
+	message := r.Method + "\n" + r.URL.Path + "\n" + ts + "\n" + nonce + "\n" + hex.EncodeToString(bodyHash[:])
+	mac := hmac.New(sha256.New, []byte(a.token))
+	_, _ = mac.Write([]byte(message))
+	if !hmac.Equal(sig, mac.Sum(nil)) {
+		return false
+	}
+	return a.replay.consume(nonce, time.Now().Add(6*time.Minute))
+}
+
+func (g *ReplayGuard) consume(nonce string, expiry time.Time) bool {
+	now := time.Now()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for k, exp := range g.seen {
+		if now.After(exp) {
+			delete(g.seen, k)
+		}
+	}
+	if _, exists := g.seen[nonce]; exists {
+		return false
+	}
+	g.seen[nonce] = expiry
+	return true
+}
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
 }
 
 func (a *Agent) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -237,7 +367,7 @@ func (a *Agent) loadState() error {
 
 func (a *Agent) saveState() error { return writeAtomicJSON(a.statePath, a.rules, 0600) }
 
-func (a *Agent) writeConfig() error {
+func (a *Agent) renderConfig() []byte {
 	var b strings.Builder
 	b.WriteString("# Managed by realm-agent. Manual edits will be overwritten.\n\n[network]\nno_tcp = false\nuse_udp = true\n")
 	ids := make([]string, 0, len(a.rules))
@@ -255,7 +385,21 @@ func (a *Agent) writeConfig() error {
 		b.WriteString(strconv.Quote(r.Remote))
 		b.WriteByte('\n')
 	}
-	return writeAtomic(a.configPath, []byte(b.String()), 0644)
+	return []byte(b.String())
+}
+
+func (a *Agent) writeConfig() error { return writeAtomic(a.configPath, a.renderConfig(), 0644) }
+
+func (a *Agent) reconcileConfig() (bool, error) {
+	desired := a.renderConfig()
+	current, err := os.ReadFile(a.configPath)
+	if err == nil && bytes.Equal(current, desired) {
+		return false, nil
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	return true, writeAtomic(a.configPath, desired, 0644)
 }
 
 func (a *Agent) registrationLoop() {
@@ -275,8 +419,9 @@ func (a *Agent) register() error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(tokenHeader, a.token)
-	req.Header.Set("-Token", a.token)
+	if err := signRequest(req, b, a.token); err != nil {
+		return err
+	}
 	resp, err := a.client.Do(req)
 	if err != nil {
 		return err
@@ -289,6 +434,23 @@ func (a *Agent) register() error {
 	return nil
 }
 
+func signRequest(req *http.Request, body []byte, token string) error {
+	nonceBytes := make([]byte, 18)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return err
+	}
+	nonce := base64.RawURLEncoding.EncodeToString(nonceBytes)
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	bodyHash := sha256.Sum256(body)
+	message := req.Method + "\n" + req.URL.Path + "\n" + ts + "\n" + nonce + "\n" + hex.EncodeToString(bodyHash[:])
+	mac := hmac.New(sha256.New, []byte(token))
+	_, _ = mac.Write([]byte(message))
+	req.Header.Set("X-Realm-Timestamp", ts)
+	req.Header.Set("X-Realm-Nonce", nonce)
+	req.Header.Set(tokenHeader, hex.EncodeToString(mac.Sum(nil)))
+	return nil
+}
+
 // decodeCommand authenticates the AES-256-GCM command envelope before parsing
 // its JSON payload. Authentication of the HTTP caller is handled separately.
 func (a *Agent) decodeCommand(r *http.Request, dst any) error {
@@ -297,7 +459,7 @@ func (a *Agent) decodeCommand(r *http.Request, dst any) error {
 		Nonce      string `json:"nonce"`
 		Ciphertext string `json:"ciphertext"`
 	}
-	d := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	d := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
 	d.DisallowUnknownFields()
 	if err := d.Decode(&envelope); err != nil {
 		return fmt.Errorf("invalid encrypted envelope: %w", err)
@@ -391,7 +553,7 @@ func sortStrings(v []string) {
 }
 func decodeJSON(r *http.Request, dst any) error {
 	defer r.Body.Close()
-	d := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	d := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
 	d.DisallowUnknownFields()
 	return d.Decode(dst)
 }

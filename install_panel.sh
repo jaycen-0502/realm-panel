@@ -26,7 +26,7 @@ esac
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl openssl tar
+apt-get install -y --no-install-recommends ca-certificates curl jq openssl tar
 
 machine_arch="$(uname -m)"
 if [[ "$machine_arch" != "x86_64" && "$machine_arch" != "amd64" ]]; then
@@ -40,6 +40,10 @@ if [[ "$TOKEN" == *$'\n'* || "$PANEL_PASSWORD" == *$'\n'* ]]; then
   echo "Token and password cannot contain newlines." >&2
   exit 2
 fi
+if (( ${#TOKEN} < 32 || ${#PANEL_PASSWORD} < 12 )); then
+  echo "Token must be at least 32 characters and panel password at least 12 characters." >&2
+  exit 2
+fi
 
 source_dir="$(mktemp -d)"
 cleanup() { rm -rf -- "$source_dir"; }
@@ -51,13 +55,18 @@ curl --fail --location "$REPO_RAW_URL/agent.go" -o "$source_dir/agent.go"
 
 # Use the current official Go toolchain so older Debian/Ubuntu releases are not
 # limited by the old compiler in their package repositories.
-go_version="$(curl --fail --silent --show-error --location 'https://go.dev/VERSION?m=text')"
-go_version="${go_version%%$'\n'*}"
+go_metadata="$(curl --fail --silent --show-error --location 'https://go.dev/dl/?mode=json')"
+go_version="$(printf '%s' "$go_metadata" | jq -r 'map(select(.stable))[0].version')"
+go_sha256="$(printf '%s' "$go_metadata" | jq -r 'map(select(.stable))[0].files[] | select(.os=="linux" and .arch=="amd64" and .kind=="archive") | .sha256')"
 if [[ ! "$go_version" =~ ^go[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
   echo "Could not determine the current stable Go version." >&2
   exit 1
 fi
 curl --fail --location "https://go.dev/dl/${go_version}.linux-amd64.tar.gz" -o "$source_dir/go.tar.gz"
+printf '%s  %s\n' "$go_sha256" "$source_dir/go.tar.gz" | sha256sum --check --status || {
+  echo "Go toolchain checksum verification failed." >&2
+  exit 1
+}
 tar -xzf "$source_dir/go.tar.gz" -C "$source_dir"
 go_binary="$source_dir/go/bin/go"
 
@@ -65,7 +74,10 @@ CGO_ENABLED=0 "$go_binary" build -trimpath -ldflags='-s -w' -o /usr/local/bin/re
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$go_binary" build -trimpath -ldflags='-s -w' -o "$source_dir/agent-linux-amd64" "$source_dir/agent.go"
 
 install -d -m 0755 /opt/realm-panel
-install -d -m 0700 /var/lib/realm-panel
+if ! id realm-panel >/dev/null 2>&1; then
+  useradd --system --no-create-home --home-dir /var/lib/realm-panel --shell /usr/sbin/nologin realm-panel
+fi
+install -d -o realm-panel -g realm-panel -m 0700 /var/lib/realm-panel
 install -m 0755 "$source_dir/agent-linux-amd64" /opt/realm-panel/agent-linux-amd64
 
 quote_env() {
@@ -93,6 +105,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=realm-panel
+Group=realm-panel
 EnvironmentFile=/etc/realm-panel.env
 ExecStart=/usr/local/bin/realm-panel
 WorkingDirectory=/var/lib/realm-panel
@@ -101,6 +115,20 @@ RestartSec=5
 NoNewPrivileges=true
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/realm-panel
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
