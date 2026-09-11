@@ -70,7 +70,7 @@ printf '%s  %s\n' "$go_sha256" "$source_dir/go.tar.gz" | sha256sum --check --sta
 tar -xzf "$source_dir/go.tar.gz" -C "$source_dir"
 go_binary="$source_dir/go/bin/go"
 
-CGO_ENABLED=0 "$go_binary" build -trimpath -ldflags='-s -w' -o /usr/local/bin/realm-panel "$source_dir/main.go"
+CGO_ENABLED=0 "$go_binary" build -trimpath -ldflags='-s -w' -o "$source_dir/realm-panel" "$source_dir/main.go"
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$go_binary" build -trimpath -ldflags='-s -w' -o "$source_dir/agent-linux-amd64" "$source_dir/agent.go"
 
 install -d -m 0755 /opt/realm-panel
@@ -78,6 +78,8 @@ if ! id realm-panel >/dev/null 2>&1; then
   useradd --system --no-create-home --home-dir /var/lib/realm-panel --shell /usr/sbin/nologin realm-panel
 fi
 install -d -o realm-panel -g realm-panel -m 0700 /var/lib/realm-panel
+install -m 0755 "$source_dir/realm-panel" /usr/local/bin/.realm-panel.new
+mv -f /usr/local/bin/.realm-panel.new /usr/local/bin/realm-panel
 install -m 0755 "$source_dir/agent-linux-amd64" /opt/realm-panel/agent-linux-amd64
 
 quote_env() {
@@ -135,7 +137,8 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
-systemctl enable --now realm-panel.service
+systemctl enable realm-panel.service
+systemctl restart realm-panel.service
 
 panel_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
 panel_ip="${panel_ip:-MASTER_IP}"

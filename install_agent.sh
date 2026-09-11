@@ -91,8 +91,11 @@ install -d -m 0755 /etc/realm
 if ! id realm >/dev/null 2>&1; then
   useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin realm
 fi
-install -m 0755 "$realm_file" /usr/local/bin/realm
-install -m 0755 "$work_dir/realm-agent" /usr/local/bin/realm-agent
+# Rename-over replacement is safe while an older binary is still executing.
+install -m 0755 "$realm_file" /usr/local/bin/.realm.new
+mv -f /usr/local/bin/.realm.new /usr/local/bin/realm
+install -m 0755 "$work_dir/realm-agent" /usr/local/bin/.realm-agent.new
+mv -f /usr/local/bin/.realm-agent.new /usr/local/bin/realm-agent
 
 # EnvironmentFile avoids fragile shell quoting in the unit itself. Values are JSON
 # string literals, which systemd accepts as quoted EnvironmentFile values.
@@ -198,7 +201,8 @@ systemctl enable realm.service
 if grep -q '^\[\[endpoints\]\]' /etc/realm/config.toml; then
   systemctl restart realm.service
 fi
-systemctl enable --now realm-agent.service
+systemctl enable realm-agent.service
+systemctl restart realm-agent.service
 
 echo "Installed successfully. Node '$NODE_NAME' will register with $MASTER_URL."
 echo "Agent status: systemctl status realm-agent --no-pager"
