@@ -385,10 +385,14 @@ func sameOrigin(r *http.Request) bool {
 		u, err := url.Parse(origin)
 		return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.User == nil && u.Host != "" && strings.EqualFold(u.Host, r.Host)
 	}
+	if referer := r.Header.Get("Referer"); referer != "" {
+		u, err := url.Parse(referer)
+		return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.User == nil && u.Host != "" && strings.EqualFold(u.Host, r.Host)
+	}
 
 	// Origin is authoritative when present. Some browsers/extensions report a
-	// matching-origin form POST as "same-site", so Sec-Fetch-Site must only be
-	// used as a fallback instead of overriding an exact Origin match.
+	// matching-origin form POST as "same-site". Referer is a compatible fallback
+	// for clients that omit Origin, while Sec-Fetch-Site is only used last.
 	switch r.Header.Get("Sec-Fetch-Site") {
 	case "cross-site", "same-site":
 		return false

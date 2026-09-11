@@ -18,22 +18,36 @@ func TestSameOriginAllowsMatchingOriginWithSameSiteMetadata(t *testing.T) {
 	}
 }
 
+func TestSameOriginAllowsMatchingRefererWithoutOrigin(t *testing.T) {
+	r := httptest.NewRequest("POST", "http://43.153.54.154:6800/bind", strings.NewReader("node_name=test"))
+	r.Header.Set("Referer", "http://43.153.54.154:6800/bind")
+	r.Header.Set("Sec-Fetch-Site", "same-site")
+	if !sameOrigin(r) {
+		t.Fatal("matching Referer must allow clients that omit Origin")
+	}
+}
+
 func TestSameOriginRejectsUntrustedRequests(t *testing.T) {
 	tests := []struct {
-		name   string
-		origin string
-		site   string
+		name    string
+		origin  string
+		referer string
+		site    string
 	}{
 		{name: "different origin", origin: "http://attacker.example"},
 		{name: "cross-site without origin", site: "cross-site"},
 		{name: "same-site without verifiable origin", site: "same-site"},
 		{name: "opaque origin", origin: "null"},
+		{name: "different referer", referer: "http://attacker.example/form", site: "same-site"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			r := httptest.NewRequest("POST", "http://43.153.54.154:6800/bind", nil)
 			if tc.origin != "" {
 				r.Header.Set("Origin", tc.origin)
+			}
+			if tc.referer != "" {
+				r.Header.Set("Referer", tc.referer)
 			}
 			if tc.site != "" {
 				r.Header.Set("Sec-Fetch-Site", tc.site)
