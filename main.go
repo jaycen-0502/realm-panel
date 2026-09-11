@@ -137,6 +137,7 @@ type App struct {
 	binaryMAC     string
 	client        *http.Client
 	tmpl          *template.Template
+	bindTmpl      *template.Template
 	replay        *ReplayGuard
 	loginLimit    *RateLimiter
 	apiLimit      *RateLimiter
@@ -201,12 +202,15 @@ func main() {
 				return id
 			},
 		}).Parse(pageHTML)),
+		bindTmpl: template.Must(template.New("bind").Parse(bindPageHTML)),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", app.handleHome)
 	mux.HandleFunc("/login", app.rateLimited(app.loginLimit, app.handleLogin))
 	mux.HandleFunc("/logout", app.handleLogout)
+	mux.HandleFunc("/bind", app.handleBind)
+	mux.HandleFunc("/static/bind.js", handleBindJS)
 	mux.HandleFunc("/api/register", app.rateLimited(app.apiLimit, app.handleRegister))
 	mux.HandleFunc("/api/add_rule", app.handleAddRule)
 	mux.HandleFunc("/api/delete_rule", app.handleDeleteRule)
@@ -415,6 +419,66 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{Name: "realm_session", Value: "", Path: "/", HttpOnly: true, MaxAge: -1, SameSite: http.SameSiteStrictMode})
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+type bindPageData struct {
+	MasterURL string
+	NodeName  string
+	Command   string
+	Error     string
+}
+
+func (a *App) handleBind(w http.ResponseWriter, r *http.Request) {
+	if !a.requireUser(w, r) {
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	data := bindPageData{MasterURL: requestBaseURL(r)}
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+		if err := r.ParseForm(); err != nil {
+			data.Error = "提交内容无效"
+		} else {
+			data.MasterURL = strings.TrimRight(strings.TrimSpace(r.FormValue("master_url")), "/")
+			data.NodeName = strings.TrimSpace(r.FormValue("node_name"))
+			u, err := url.Parse(data.MasterURL)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+				data.Error = "主控地址必须是完整的 http:// 或 https:// 地址"
+			} else if data.NodeName == "" || len(data.NodeName) > 80 || strings.ContainsAny(data.NodeName, "\r\n\x00") {
+				data.Error = "节点名称必须为 1-80 个字符"
+			} else {
+				data.Command = "curl -fsSL https://raw.githubusercontent.com/jaycen-0502/realm-panel/main/install_agent.sh -o /tmp/install_agent.sh && sudo bash /tmp/install_agent.sh " + shellQuote(data.MasterURL) + " " + shellQuote(a.token) + " " + shellQuote(data.NodeName)
+			}
+		}
+	} else if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if err := a.bindTmpl.Execute(w, data); err != nil {
+		log.Printf("bind template: %v", err)
+	}
+}
+
+func requestBaseURL(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
+}
+
+func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }
+
+func handleBindJS(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	_, _ = io.WriteString(w, `document.addEventListener("DOMContentLoaded",()=>{const b=document.getElementById("copy"),c=document.getElementById("command");if(b&&c)b.addEventListener("click",async()=>{try{await navigator.clipboard.writeText(c.value);b.textContent="已复制"}catch(e){c.select();document.execCommand("copy");b.textContent="已复制"}})});`)
 }
 
 func (a *App) handleHome(w http.ResponseWriter, r *http.Request) {
@@ -758,4 +822,6 @@ func (a *App) actionOK(w http.ResponseWriter, r *http.Request, msg string) {
 
 const loginHTML = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Realm 登录</title><style>body{font:16px system-ui;background:#101827;color:#e5e7eb;display:grid;place-items:center;height:100vh;margin:0}form{background:#1f2937;padding:28px;border-radius:14px;width:min(340px,80vw)}input,button{box-sizing:border-box;width:100%;padding:12px;margin-top:12px;border-radius:8px;border:1px solid #4b5563}button{background:#2563eb;color:white;border:0}</style><form method="post"><h2>Realm 管理面板</h2><input name="username" type="text" placeholder="管理员用户名" autocomplete="username" required autofocus><input name="password" type="password" placeholder="管理密码" autocomplete="current-password" required><button>登录</button></form></html>`
 
-const pageHTML = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Realm 面板</title><style>body{font:15px system-ui;background:#f3f4f6;color:#111827;margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;align-items:center}.card{background:white;padding:20px;margin:18px 0;border-radius:12px;box-shadow:0 2px 10px #0001}input,select,button{padding:9px;border:1px solid #d1d5db;border-radius:7px}button{background:#2563eb;color:white;border:0}.danger{background:#dc2626}table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid #e5e7eb;padding:10px}.msg{background:#dbeafe;padding:10px;border-radius:8px}.muted{color:#6b7280;font-size:13px}@media(max-width:700px){table{display:block;overflow:auto}}</style><div class="wrap"><div class="top"><h1>Realm 转发管理</h1><a href="/logout">退出</a></div>{{if .Message}}<div class="msg">{{.Message}}</div>{{end}}<div class="card"><h2>添加规则</h2><form method="post" action="/api/add_rule"><select name="node_id" required><option value="">选择节点</option>{{range $id,$n := .Nodes}}<option value="{{$id}}">{{$n.Name}}（{{$n.IP}}）</option>{{end}}</select> <input name="listen" placeholder="0.0.0.0:5000" required> <input name="remote" placeholder="目标IP或域名:端口" required> <button>保存并应用</button></form></div><div class="card"><h2>节点</h2><table><tr><th>名称</th><th>IP</th><th>Agent</th><th>最后注册/心跳</th></tr>{{range $id,$n := .Nodes}}<tr><td>{{$n.Name}}</td><td>{{$n.IP}}</td><td>{{$n.AgentURL}}</td><td>{{age $n.LastSeen}} 前</td></tr>{{else}}<tr><td colspan="4" class="muted">暂无节点，请在节点机器执行安装命令。</td></tr>{{end}}</table></div><div class="card"><h2>转发规则</h2><table><tr><th>节点</th><th>监听</th><th>目标</th><th></th></tr>{{range .Rules}}<tr><td>{{nodeName $.Nodes .NodeID}}</td><td>{{.Listen}}</td><td>{{.Remote}}</td><td><form method="post" action="/api/delete_rule"><input type="hidden" name="id" value="{{.ID}}"><button class="danger">删除</button></form></td></tr>{{else}}<tr><td colspan="4" class="muted">暂无规则。</td></tr>{{end}}</table></div></div></html>`
+const pageHTML = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Realm 面板</title><style>body{font:15px system-ui;background:#f3f4f6;color:#111827;margin:0}.wrap{max-width:1050px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;align-items:center}.actions{display:flex;gap:16px}.card{background:white;padding:20px;margin:18px 0;border-radius:12px;box-shadow:0 2px 10px #0001}input,select,button{padding:9px;border:1px solid #d1d5db;border-radius:7px}button,.primary{background:#2563eb;color:white;border:0;text-decoration:none;padding:9px 13px;border-radius:7px}.danger{background:#dc2626}table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid #e5e7eb;padding:10px}.msg{background:#dbeafe;padding:10px;border-radius:8px}.muted{color:#6b7280;font-size:13px}@media(max-width:700px){table{display:block;overflow:auto}}</style><div class="wrap"><div class="top"><h1>Realm 转发管理</h1><div class="actions"><a class="primary" href="/bind" target="_blank" rel="noopener">绑定新节点</a><a href="/logout">退出</a></div></div>{{if .Message}}<div class="msg">{{.Message}}</div>{{end}}<div class="card"><h2>添加规则</h2><form method="post" action="/api/add_rule"><select name="node_id" required><option value="">选择节点</option>{{range $id,$n := .Nodes}}<option value="{{$id}}">{{$n.Name}}（{{$n.IP}}）</option>{{end}}</select> <input name="listen" placeholder="0.0.0.0:5000" required> <input name="remote" placeholder="目标IP或域名:端口" required> <button>保存并应用</button></form></div><div class="card"><h2>节点</h2><table><tr><th>名称</th><th>IP</th><th>Agent</th><th>最后注册/心跳</th></tr>{{range $id,$n := .Nodes}}<tr><td>{{$n.Name}}</td><td>{{$n.IP}}</td><td>{{$n.AgentURL}}</td><td>{{age $n.LastSeen}} 前</td></tr>{{else}}<tr><td colspan="4" class="muted">暂无节点，点击右上角“绑定新节点”生成安装命令。</td></tr>{{end}}</table></div><div class="card"><h2>转发规则</h2><table><tr><th>节点</th><th>监听</th><th>目标</th><th></th></tr>{{range .Rules}}<tr><td>{{nodeName $.Nodes .NodeID}}</td><td>{{.Listen}}</td><td>{{.Remote}}</td><td><form method="post" action="/api/delete_rule"><input type="hidden" name="id" value="{{.ID}}"><button class="danger">删除</button></form></td></tr>{{else}}<tr><td colspan="4" class="muted">暂无规则。</td></tr>{{end}}</table></div></div></html>`
+
+const bindPageHTML = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>绑定 Realm 节点</title><style>body{font:16px system-ui;background:#f3f4f6;color:#111827;margin:0}.wrap{max-width:760px;margin:40px auto;padding:24px}.card{background:#fff;padding:26px;border-radius:14px;box-shadow:0 2px 12px #0001}label{display:block;font-weight:600;margin-top:18px}input,textarea,button{box-sizing:border-box;width:100%;padding:11px;margin-top:7px;border:1px solid #cbd5e1;border-radius:8px}button{background:#2563eb;color:#fff;border:0;font-weight:600}.copy{background:#059669}.error{background:#fee2e2;color:#991b1b;padding:10px;border-radius:8px}.tip{color:#64748b;font-size:14px;line-height:1.6}textarea{height:150px;font:13px ui-monospace,monospace;resize:vertical}</style><script defer src="/static/bind.js"></script><div class="wrap"><div class="card"><h1>绑定新节点</h1><p class="tip">填写节点名称，生成命令后复制到需要绑定的 Debian/Ubuntu 服务器执行。共享 Token 只在当前登录页面中临时显示，页面不会缓存。</p>{{if .Error}}<div class="error">{{.Error}}</div>{{end}}<form method="post"><label>主控地址</label><input name="master_url" value="{{.MasterURL}}" placeholder="http://主控IP:6800" required><label>节点名称</label><input name="node_name" value="{{.NodeName}}" placeholder="例如：香港节点-A" maxlength="80" required><button type="submit">生成一键绑定命令</button></form>{{if .Command}}<label>在节点服务器执行</label><textarea id="command" readonly>{{.Command}}</textarea><button id="copy" class="copy" type="button">复制命令</button><p class="tip">执行完成后返回主面板刷新，节点通常会在几秒内出现。节点的 6800/TCP 应只允许主控服务器访问。</p>{{end}}</div></div></html>`

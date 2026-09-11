@@ -5,6 +5,7 @@
 ## 功能
 
 - 网页面板登录、节点列表、规则添加与删除
+- 面板内“绑定新节点”窗口，可生成并复制一键安装命令
 - Agent 自动注册并每分钟刷新在线时间
 - AES-256-GCM 加密面板到 Agent 的规则指令
 - 短时 HMAC-SHA256 请求签名，Token 不通过网络发送
@@ -33,7 +34,7 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/realm-panel/main/instal
 
 ## 节点一键绑定
 
-将安装结束时显示的命令复制到节点执行，或使用：
+登录面板后点击右上角“绑定新节点”，填写节点名称并复制生成的命令到节点服务器执行。也可以手动使用：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jaycen-0502/realm-panel/main/install_agent.sh -o /tmp/install_agent.sh
