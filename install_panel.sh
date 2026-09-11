@@ -6,6 +6,14 @@ set -Eeuo pipefail
 # sudo bash install_panel.sh [TOKEN] [PANEL_PASSWORD] [PANEL_USERNAME]
 
 REPO_RAW_URL="${REPO_RAW_URL:-https://raw.githubusercontent.com/jaycen-0502/realm-panel/main}"
+
+# Re-running the installer is an in-place upgrade. Preserve the existing
+# credentials and token unless the caller explicitly supplies new values.
+if [[ $# -eq 0 && -r /etc/realm-panel.env ]]; then
+  # shellcheck disable=SC1091
+  . /etc/realm-panel.env
+fi
+
 TOKEN="${1:-${REALM_TOKEN:-}}"
 PANEL_PASSWORD="${2:-${PANEL_PASSWORD:-}}"
 PANEL_USERNAME="${3:-${PANEL_USERNAME:-}}"

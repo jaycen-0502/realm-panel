@@ -33,6 +33,8 @@ curl -fsSL https://raw.githubusercontent.com/jaycen-0502/realm-panel/main/instal
   | sudo bash -s -- '你的长随机Token' '你的面板密码' '你的管理员用户名'
 ```
 
+重复执行上面的安装命令会自动保留现有用户名、密码、Token、节点和规则，并完成面板升级；不需要再次输入凭据。
+
 ## 节点一键绑定
 
 登录面板后点击右上角“绑定新节点”，填写节点名称并复制生成的命令到节点服务器执行。也可以手动使用：
